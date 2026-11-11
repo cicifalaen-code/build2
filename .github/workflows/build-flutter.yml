@@ -2,8 +2,9 @@ name: build-flutter
 
 # Dipanggil oleh bot lewat workflow_dispatch dengan input: jobId, userId, payload.
 # payload (JSON):
-#   mode "zip": { mode, url, buildType, tag }        -> build project Flutter / Android dari ZIP
-#   mode "url": { mode, url, appName, iconUrl }      -> bikin APK WebView dari URL web
+#   mode "zip": { mode, url, buildType, tag, flutterVersion? } -> build project Flutter / Android dari ZIP
+#   mode "url": { mode, url, appName, iconUrl }                -> bikin APK WebView dari URL web
+# flutterVersion (opsional, mode zip): mis. "3.24.5". Kosong = Flutter stable terbaru.
 # Hasil: artifact bernama apk-<jobId> berisi file .apk
 
 on:
@@ -29,7 +30,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       PAYLOAD: ${{ inputs.payload }}
       JOB_ID: ${{ inputs.jobId }}
@@ -38,8 +39,9 @@ jobs:
         id: p
         run: |
           set -e
-          echo "mode=$(echo "$PAYLOAD" | jq -r '.mode // "zip"')"           >> "$GITHUB_OUTPUT"
-          echo "buildType=$(echo "$PAYLOAD" | jq -r '.buildType // "release"')" >> "$GITHUB_OUTPUT"
+          echo "mode=$(echo "$PAYLOAD" | jq -r '.mode // "zip"')"                       >> "$GITHUB_OUTPUT"
+          echo "buildType=$(echo "$PAYLOAD" | jq -r '.buildType // "release"')"         >> "$GITHUB_OUTPUT"
+          echo "flutterVersion=$(echo "$PAYLOAD" | jq -r '.flutterVersion // ""')"      >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-java@v4
         with:
@@ -49,7 +51,15 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          # kosong = stable terbaru; isi lewat payload.flutterVersion untuk project lama
+          flutter-version: ${{ steps.p.outputs.flutterVersion }}
           cache: true
+
+      - name: Info toolchain
+        run: |
+          flutter --version
+          java -version
+          flutter config --no-analytics || true
 
       # ───────────── MODE ZIP: build project dari ZIP source ─────────────
       - name: Download & extract source
@@ -61,12 +71,75 @@ jobs:
           curl -fL --retry 3 -H "Authorization: Bearer ${{ github.token }}" -o src.zip "$URL"
           unzip -q src.zip -d src
           # cari root project (folder yang punya pubspec.yaml atau gradlew)
-          ROOT=$(find src -maxdepth 4 -name pubspec.yaml -printf '%h\n' | head -n1)
+          ROOT=$(find src -maxdepth 4 -name pubspec.yaml -not -path '*/.*' -printf '%h\n' | head -n1)
           if [ -z "$ROOT" ]; then
             ROOT=$(find src -maxdepth 4 -name gradlew -printf '%h\n' | head -n1)
           fi
           [ -n "$ROOT" ] || { echo "Project Flutter/Android tidak ditemukan di ZIP"; exit 1; }
           echo "PROJECT_DIR=$RUNNER_TEMP/$ROOT" >> "$GITHUB_ENV"
+
+      # Naikkan Gradle / AGP / Kotlin hanya kalau versinya di bawah minimum Flutter terbaru
+      - name: Auto-patch Gradle, AGP, Kotlin
+        if: steps.p.outputs.mode == 'zip'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          if [ -f pubspec.yaml ] && [ -d android ]; then
+          python3 - <<'PY'
+          import re, pathlib
+
+          MIN_GRADLE, NEW_GRADLE = (8, 14, 0), "8.14"
+          MIN_AGP,    NEW_AGP    = (8, 7, 0),  "8.11.1"
+          MIN_KOTLIN, NEW_KOTLIN = (2, 1, 0),  "2.2.20"
+
+          def ver(s):
+              n = [int(x) for x in re.findall(r'\d+', s)[:3]]
+              return tuple(n + [0] * (3 - len(n)))
+
+          def bump(text, pattern, minv, newv):
+              def r(m):
+                  return m.group(1) + newv + m.group(3) if ver(m.group(2)) < minv else m.group(0)
+              return re.sub(pattern, r, text)
+
+          # 1) Gradle wrapper
+          w = pathlib.Path("android/gradle/wrapper/gradle-wrapper.properties")
+          if w.exists():
+              t = w.read_text()
+              t = bump(t, r'(gradle-)([\d.]+)(-(?:all|bin)\.zip)', MIN_GRADLE, NEW_GRADLE)
+              w.write_text(t)
+
+          # 2) AGP + Kotlin (settings.gradle[.kts] dan build.gradle[.kts])
+          for f in ["android/settings.gradle", "android/settings.gradle.kts",
+                    "android/build.gradle", "android/build.gradle.kts"]:
+              p = pathlib.Path(f)
+              if not p.exists():
+                  continue
+              t = p.read_text()
+              # gaya plugins { id "..." version "x" }
+              t = bump(t, r'(id\s*\(?\s*["\']com\.android\.(?:application|library)["\']\s*\)?\s*version\s*["\'])([\d.]+)(["\'])', MIN_AGP, NEW_AGP)
+              t = bump(t, r'(id\s*\(?\s*["\']org\.jetbrains\.kotlin\.android["\']\s*\)?\s*version\s*["\'])([\d.]+)(["\'])', MIN_KOTLIN, NEW_KOTLIN)
+              # gaya buildscript lama
+              t = bump(t, r'(com\.android\.tools\.build:gradle:)([\d.]+)()', MIN_AGP, NEW_AGP)
+              t = bump(t, r'(kotlin-gradle-plugin:)([\d.]+)()', MIN_KOTLIN, NEW_KOTLIN)
+              t = bump(t, r'(ext\.kotlin_version\s*=\s*["\'])([\d.]+)(["\'])', MIN_KOTLIN, NEW_KOTLIN)
+              p.write_text(t)
+
+          # 3) gradle.properties: opt-out DSL baru AGP 9 + AndroidX
+          gp = pathlib.Path("android/gradle.properties")
+          t = gp.read_text() if gp.exists() else ""
+          add = []
+          for k, v in [("android.newDsl", "false"),
+                       ("android.useAndroidX", "true"),
+                       ("android.enableJetifier", "true"),
+                       ("org.gradle.jvmargs", "-Xmx4G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError")]:
+              if not re.search(r'^\s*' + re.escape(k) + r'\s*=', t, re.M):
+                  add.append(f"{k}={v}")
+          if add:
+              t = t.rstrip("\n") + "\n" + "\n".join(add) + "\n"
+              gp.write_text(t)
+          print("Patch selesai")
+          PY
+          fi
 
       - name: Build (Flutter / Android native)
         if: steps.p.outputs.mode == 'zip'
@@ -75,15 +148,25 @@ jobs:
           set -e
           MODE=release
           [ "${{ steps.p.outputs.buildType }}" = "debug" ] && MODE=debug
+          mkdir -p "$GITHUB_WORKSPACE/out"
+
           if [ -f pubspec.yaml ]; then
-            flutter pub get
-            flutter build apk --$MODE
-            mkdir -p "$GITHUB_WORKSPACE/out"
-            cp build/app/outputs/flutter-apk/*.apk "$GITHUB_WORKSPACE/out/" 
+            # Pub get, dengan fallback longgarkan batas SDK untuk project lama
+            if ! flutter pub get; then
+              echo "pub get gagal, coba longgarkan constraint SDK..."
+              sed -i -E 's#^(\s*sdk:\s*)["'\'']?>=?\s*([0-9.]+)[^"'\'']*["'\'']?\s*$#\1">=\2 <4.0.0"#' pubspec.yaml || true
+              flutter pub get || flutter pub upgrade
+            fi
+
+            # Build, retry dengan bypass validasi dependency Android kalau gagal
+            if ! flutter build apk --$MODE --no-tree-shake-icons; then
+              echo "Build gagal, retry dengan --android-skip-build-dependency-validation"
+              flutter build apk --$MODE --no-tree-shake-icons --android-skip-build-dependency-validation
+            fi
+            cp build/app/outputs/flutter-apk/*.apk "$GITHUB_WORKSPACE/out/"
           else
             chmod +x gradlew
             if [ "$MODE" = "debug" ]; then ./gradlew assembleDebug --no-daemon; else ./gradlew assembleRelease --no-daemon; fi
-            mkdir -p "$GITHUB_WORKSPACE/out"
             find . -path '*build/outputs/apk*' -name '*.apk' -exec cp {} "$GITHUB_WORKSPACE/out/" \;
           fi
 
@@ -120,7 +203,7 @@ jobs:
           name = sys.argv[1].replace('&','&amp;').replace('"','&quot;').replace('<','&lt;')
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p, encoding='utf-8').read()
-          s = re.sub(r'android:label="[^"]*"', 'android:label="%s"' % name, s, count=1)
+          s = re.sub(r'android:label="[^"]*"', lambda m: 'android:label="%s"' % name, s, count=1)
           s = s.replace('<application', '<uses-permission android:name="android.permission.INTERNET"/>\n    <application', 1)
           s = s.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
           open(p, 'w', encoding='utf-8').write(s)
@@ -143,7 +226,9 @@ jobs:
         run: |
           set -e
           flutter pub get
-          flutter build apk --release
+          if ! flutter build apk --release; then
+            flutter build apk --release --android-skip-build-dependency-validation
+          fi
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/out/"
 
@@ -157,4 +242,3 @@ jobs:
           path: out/*.apk
           retention-days: 1
           if-no-files-found: error
-          
