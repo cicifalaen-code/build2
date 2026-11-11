@@ -1,0 +1,160 @@
+name: build-flutter
+
+# Dipanggil oleh bot lewat workflow_dispatch dengan input: jobId, userId, payload.
+# payload (JSON):
+#   mode "zip": { mode, url, buildType, tag }        -> build project Flutter / Android dari ZIP
+#   mode "url": { mode, url, appName, iconUrl }      -> bikin APK WebView dari URL web
+# Hasil: artifact bernama apk-<jobId> berisi file .apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "ID job unik"
+        required: true
+        type: string
+      userId:
+        description: "ID user"
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: "JSON payload dari bot"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PAYLOAD: ${{ inputs.payload }}
+      JOB_ID: ${{ inputs.jobId }}
+    steps:
+      - name: Parse payload
+        id: p
+        run: |
+          set -e
+          echo "mode=$(echo "$PAYLOAD" | jq -r '.mode // "zip"')"           >> "$GITHUB_OUTPUT"
+          echo "buildType=$(echo "$PAYLOAD" | jq -r '.buildType // "release"')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # ───────────── MODE ZIP: build project dari ZIP source ─────────────
+      - name: Download & extract source
+        if: steps.p.outputs.mode == 'zip'
+        run: |
+          set -e
+          URL=$(echo "$PAYLOAD" | jq -r '.url')
+          mkdir -p "$RUNNER_TEMP/src" && cd "$RUNNER_TEMP"
+          curl -fL --retry 3 -H "Authorization: Bearer ${{ github.token }}" -o src.zip "$URL"
+          unzip -q src.zip -d src
+          # cari root project (folder yang punya pubspec.yaml atau gradlew)
+          ROOT=$(find src -maxdepth 4 -name pubspec.yaml -printf '%h\n' | head -n1)
+          if [ -z "$ROOT" ]; then
+            ROOT=$(find src -maxdepth 4 -name gradlew -printf '%h\n' | head -n1)
+          fi
+          [ -n "$ROOT" ] || { echo "Project Flutter/Android tidak ditemukan di ZIP"; exit 1; }
+          echo "PROJECT_DIR=$RUNNER_TEMP/$ROOT" >> "$GITHUB_ENV"
+
+      - name: Build (Flutter / Android native)
+        if: steps.p.outputs.mode == 'zip'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          MODE=release
+          [ "${{ steps.p.outputs.buildType }}" = "debug" ] && MODE=debug
+          if [ -f pubspec.yaml ]; then
+            flutter pub get
+            flutter build apk --$MODE
+            mkdir -p "$GITHUB_WORKSPACE/out"
+            cp build/app/outputs/flutter-apk/*.apk "$GITHUB_WORKSPACE/out/" 
+          else
+            chmod +x gradlew
+            if [ "$MODE" = "debug" ]; then ./gradlew assembleDebug --no-daemon; else ./gradlew assembleRelease --no-daemon; fi
+            mkdir -p "$GITHUB_WORKSPACE/out"
+            find . -path '*build/outputs/apk*' -name '*.apk' -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+          fi
+
+      # ───────────── MODE URL: APK WebView dari link web ─────────────
+      - name: Generate WebView app
+        if: steps.p.outputs.mode == 'url'
+        run: |
+          set -e
+          WEB_URL=$(echo "$PAYLOAD" | jq -r '.url')
+          APP_NAME=$(echo "$PAYLOAD" | jq -r '.appName // "WebApp"')
+          ICON_URL=$(echo "$PAYLOAD" | jq -r '.iconUrl // ""')
+          cd "$RUNNER_TEMP"
+          flutter create --org com.web2apk --project-name webapp --platforms android webapp
+          cd webapp
+          flutter pub add webview_flutter
+          cat > lib/main.dart <<DART
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+          void main() => runApp(const MaterialApp(debugShowCheckedModeBanner: false, home: Home()));
+          class Home extends StatefulWidget { const Home({super.key}); @override State<Home> createState() => _S(); }
+          class _S extends State<Home> {
+            late final WebViewController c = WebViewController()
+              ..setJavaScriptMode(JavaScriptMode.unrestricted)
+              ..loadRequest(Uri.parse('${WEB_URL}'));
+            @override Widget build(BuildContext x) => PopScope(
+              canPop: false,
+              onPopInvokedWithResult: (d, r) async { if (await c.canGoBack()) { c.goBack(); } },
+              child: Scaffold(body: SafeArea(child: WebViewWidget(controller: c))));
+          }
+          DART
+          # nama app, izin internet, cleartext
+          python3 - "$APP_NAME" <<'PY'
+          import sys, re
+          name = sys.argv[1].replace('&','&amp;').replace('"','&quot;').replace('<','&lt;')
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r'android:label="[^"]*"', 'android:label="%s"' % name, s, count=1)
+          s = s.replace('<application', '<uses-permission android:name="android.permission.INTERNET"/>\n    <application', 1)
+          s = s.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          # icon (opsional)
+          if [ -n "$ICON_URL" ]; then
+            sudo apt-get install -y -qq imagemagick >/dev/null
+            if curl -fL --retry 2 -o icon_src "$ICON_URL"; then
+              for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+                dir="android/app/src/main/res/mipmap-${d%%:*}"; size="${d##*:}"
+                convert "icon_src[0]" -resize ${size}x${size} "$dir/ic_launcher.png" || true
+              done
+            fi
+          fi
+          echo "PROJECT_DIR=$RUNNER_TEMP/webapp" >> "$GITHUB_ENV"
+
+      - name: Build WebView APK
+        if: steps.p.outputs.mode == 'url'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          flutter pub get
+          flutter build apk --release
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/out/"
+
+      # ───────────── Upload hasil ─────────────
+      - name: Pastikan ada APK
+        run: ls -la "$GITHUB_WORKSPACE/out" && ls "$GITHUB_WORKSPACE/out"/*.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: out/*.apk
+          retention-days: 1
+          if-no-files-found: error
+          
